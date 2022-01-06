@@ -1,7 +1,6 @@
 package spmc
 
 import (
-	"log"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -16,7 +15,7 @@ func TestPoolDequeue(t *testing.T) {
 	if testing.Short() {
 		N = 1e3
 	}
-	d := NewPoolDequeue(16)
+	d := NewPoolDequeue[int](16)
 	have := make([]int32, N)
 	var stop int32
 	var wg sync.WaitGroup
@@ -29,9 +28,10 @@ func TestPoolDequeue(t *testing.T) {
 			for atomic.LoadInt32(&stop) == 0 {
 				val, ok := d.PopTail()
 				if ok {
+					//log.Println("pop tail", val, ok)
 					fail = 0
-					atomic.AddInt32(&have[val.(int)], 1)
-					if val.(int) == N-1 {
+					atomic.AddInt32(&have[val], 1)
+					if val == N-1 {
 						atomic.StoreInt32(&stop, 1)
 					}
 				} else {
@@ -59,7 +59,7 @@ func TestPoolDequeue(t *testing.T) {
 				val, ok := d.PopHead()
 				if ok {
 					nPopHead++
-					atomic.AddInt32(&have[val.(int)], 1)
+					atomic.AddInt32(&have[val], 1)
 				}
 			}
 		}
@@ -107,7 +107,7 @@ func BenchmarkChannelSPMC(b *testing.B) {
 }
 
 func BenchmarkSPMC(b *testing.B) {
-	pool := NewPoolChain()
+	pool := NewPoolChain[int]()
 	var wg sync.WaitGroup
 	wg.Add(1000)
 	b.ResetTimer()
@@ -122,7 +122,7 @@ func BenchmarkSPMC(b *testing.B) {
 	for i := 0; i < 1000; i++ {
 		go func() {
 			for i := 0; i < b.N/1000; i++ {
-				v, ok := pool.PopHead()
+				_, ok := pool.PopTail()
 				_ = ok
 			}
 			wg.Done()

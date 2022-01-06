@@ -16,7 +16,7 @@ import (
 // It has the added feature that it nils out unused slots to avoid
 // unnecessary retention of objects. This is important for sync.Pool,
 // but not typically a property considered in the literature.
-type poolDequeue struct {
+type poolDequeue[T any] struct {
 	// headGenTail packs together a 21-bit head index, a 21-bit
 	// ABA guard for the head, and a 21-bit tail index.
 	//
@@ -38,11 +38,7 @@ type poolDequeue struct {
 	// index has moved beyond it and typ has been set to nil. This
 	// is set to nil atomically by the consumer and read
 	// atomically by the producer.
-	vals []eface
-}
-
-type eface struct {
-	typ, val unsafe.Pointer
+	vals []*T
 }
 
 const dequeueBits = 21
@@ -59,7 +55,7 @@ const dequeueLimit = (1 << dequeueBits) / 2
 // to represent nil.
 type dequeueNil *struct{}
 
-func (d *poolDequeue) unpack(ptrs uint64) (head, gen, tail uint32) {
+func (d *poolDequeue[T]) unpack(ptrs uint64) (head, gen, tail uint32) {
 	const mask = 1<<dequeueBits - 1
 	head = uint32(ptrs >> (2 * dequeueBits) & mask)
 	gen = uint32((ptrs >> dequeueBits) & mask)
@@ -67,7 +63,7 @@ func (d *poolDequeue) unpack(ptrs uint64) (head, gen, tail uint32) {
 	return
 }
 
-func (d *poolDequeue) pack(head, gen, tail uint32) uint64 {
+func (d *poolDequeue[T]) pack(head, gen, tail uint32) uint64 {
 	const mask = 1<<dequeueBits - 1
 	return (uint64(head) << (2 * dequeueBits)) |
 		(uint64(gen&mask) << dequeueBits) |
@@ -76,7 +72,7 @@ func (d *poolDequeue) pack(head, gen, tail uint32) uint64 {
 
 // pushHead adds val at the head of the queue. It returns false if the
 // queue is full. It must only be called by a single producer.
-func (d *poolDequeue) pushHead(val interface{}) bool {
+func (d *poolDequeue[T]) pushHead(val T) bool {
 	ptrs := atomic.LoadUint64(&d.headGenTail)
 	head, _, tail := d.unpack(ptrs)
 	if tail+uint32(len(d.vals)) == head {
@@ -86,18 +82,19 @@ func (d *poolDequeue) pushHead(val interface{}) bool {
 	slot := &d.vals[head&uint32(len(d.vals)-1)]
 
 	// Check if the head slot has been released by popTail.
-	typ := atomic.LoadPointer(&slot.typ)
+
+	typ := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(slot)))
 	if typ != nil {
 		// Another goroutine is still cleaning up the tail, so
 		// the queue is actually still full.
 		return false
 	}
 
-	// The head slot is free, so we own it.
-	if val == nil {
-		val = dequeueNil(nil)
-	}
-	*(*interface{})(unsafe.Pointer(slot)) = val
+	/*// The head slot is free, so we own it.
+	if val == T(nil) {
+		//val = dequeueNil(nil)
+	}*/
+	*slot = &val
 
 	// Increment head. This passes ownership of slot to popTail.
 	// We don't increment gen here; only one of pushHead and
@@ -110,14 +107,14 @@ func (d *poolDequeue) pushHead(val interface{}) bool {
 // popHead removes and returns the element at the head of the queue.
 // It returns false if the queue is empty. It must only be called by a
 // single producer.
-func (d *poolDequeue) popHead() (interface{}, bool) {
-	var slot *eface
+func (d *poolDequeue[T]) popHead() (T, bool) {
+	var slot **T
 	for {
 		ptrs := atomic.LoadUint64(&d.headGenTail)
 		head, gen, tail := d.unpack(ptrs)
 		if tail == head {
 			// Queue is empty.
-			return nil, false
+			return zero[T](), false
 		}
 
 		// Confirm tail and decrement head. We do this before
@@ -132,27 +129,24 @@ func (d *poolDequeue) popHead() (interface{}, bool) {
 		}
 	}
 
-	val := *(*interface{})(unsafe.Pointer(slot))
-	if val == dequeueNil(nil) {
-		val = nil
-	}
+	val := *slot
 	// Zero the slot. Unlike popTail, this isn't racing with
 	// pushHead, so we don't need to be careful here.
-	*slot = eface{}
-	return val, true
+	*slot = nil
+	return *val, true
 }
 
 // popTail removes and returns the element at the tail of the queue.
 // It returns false if the queue is empty. It may be called by any
 // number of consumers.
-func (d *poolDequeue) popTail() (interface{}, bool) {
-	var slot *eface
+func (d *poolDequeue[T]) popTail() (T, bool) {
+	var slot **T
 	for {
 		ptrs := atomic.LoadUint64(&d.headGenTail)
 		head, gen, tail := d.unpack(ptrs)
 		if tail == head {
 			// Queue is empty.
-			return nil, false
+			return zero[T](), false
 		}
 
 		// Increment tail and check that head hasn't changed
@@ -167,10 +161,7 @@ func (d *poolDequeue) popTail() (interface{}, bool) {
 	}
 
 	// We now own slot.
-	val := *(*interface{})(unsafe.Pointer(slot))
-	if val == dequeueNil(nil) {
-		val = nil
-	}
+	val := *slot
 
 	// Tell pushHead that we're done with this slot. Zeroing the
 	// slot is also important so we don't leave behind references
@@ -178,11 +169,16 @@ func (d *poolDequeue) popTail() (interface{}, bool) {
 	//
 	// We write to val first and then publish that we're done with
 	// this slot by atomically writing to typ.
-	slot.val = nil
-	atomic.StorePointer(&slot.typ, nil)
+
+	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(slot)), nil)
 	// At this point pushHead owns the slot.
 
-	return val, true
+	return *val, true
+}
+
+func unsafeAddr[T any](addr *T) *unsafe.Pointer {
+	p := unsafe.Pointer(addr)
+	return &p
 }
 
 // poolChain is a dynamically-sized version of poolDequeue.
@@ -192,18 +188,18 @@ func (d *poolDequeue) popTail() (interface{}, bool) {
 // dequeue fills up, this allocates a new one and only ever pushes to
 // the latest dequeue. Pops happen from the other end of the list and
 // once a dequeue is exhausted, it gets removed from the list.
-type poolChain struct {
+type poolChain[T any] struct {
 	// head is the poolDequeue to push to. This is only accessed
 	// by the producer, so doesn't need to be synchronized.
-	head *poolChainElt
+	head *poolChainElt[T]
 
 	// tail is the poolDequeue to popTail from. This is accessed
 	// by consumers, so reads and writes must be atomic.
-	tail *poolChainElt
+	tail *poolChainElt[T]
 }
 
-type poolChainElt struct {
-	poolDequeue
+type poolChainElt[T any] struct {
+	poolDequeue[T]
 
 	// next and prev link to the adjacent poolChainElts in this
 	// poolChain.
@@ -215,24 +211,24 @@ type poolChainElt struct {
 	// prev is written atomically by the consumer and read
 	// atomically by the producer. It only transitions from
 	// non-nil to nil.
-	next, prev *poolChainElt
+	next, prev *poolChainElt[T]
 }
 
-func storePoolChainElt(pp **poolChainElt, v *poolChainElt) {
+func storePoolChainElt[T any](pp **poolChainElt[T], v *poolChainElt[T]) {
 	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(pp)), unsafe.Pointer(v))
 }
 
-func loadPoolChainElt(pp **poolChainElt) *poolChainElt {
-	return (*poolChainElt)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(pp))))
+func loadPoolChainElt[T any](pp **poolChainElt[T]) *poolChainElt[T] {
+	return (*poolChainElt[T])(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(pp))))
 }
 
-func (c *poolChain) pushHead(val interface{}) {
+func (c *poolChain[T]) pushHead(val T) {
 	d := c.head
 	if d == nil {
 		// Initialize the chain.
 		const initSize = 8 // Must be a power of 2
-		d = new(poolChainElt)
-		d.vals = make([]eface, initSize)
+		d = new(poolChainElt[T])
+		d.vals = make([]*T, initSize)
 		c.head = d
 		storePoolChainElt(&c.tail, d)
 	}
@@ -249,14 +245,19 @@ func (c *poolChain) pushHead(val interface{}) {
 		newSize = dequeueLimit
 	}
 
-	d2 := &poolChainElt{prev: d}
-	d2.vals = make([]eface, newSize)
+	d2 := &poolChainElt[T]{prev: d}
+	d2.vals = make([]*T, newSize)
 	c.head = d2
 	storePoolChainElt(&d.next, d2)
 	d2.pushHead(val)
 }
 
-func (c *poolChain) popHead() (interface{}, bool) {
+func zero[T any]() T {
+	var x T
+	return x
+}
+
+func (c *poolChain[T]) popHead() (T, bool) {
 	d := c.head
 	for d != nil {
 		if val, ok := d.popHead(); ok {
@@ -264,15 +265,15 @@ func (c *poolChain) popHead() (interface{}, bool) {
 		}
 		// There may still be unconsumed elements in the
 		// previous dequeue, so try backing up.
-		d = loadPoolChainElt(&d.prev)
+		d = loadPoolChainElt[T](&d.prev)
 	}
-	return nil, false
+	return zero[T](), false
 }
 
-func (c *poolChain) popTail() (interface{}, bool) {
-	d := loadPoolChainElt(&c.tail)
+func (c *poolChain[T]) popTail() (T, bool) {
+	d := loadPoolChainElt[T](&c.tail)
 	if d == nil {
-		return nil, false
+		return zero[T](), false
 	}
 
 	for {
@@ -282,7 +283,7 @@ func (c *poolChain) popTail() (interface{}, bool) {
 		// the pop and the pop fails, then d is permanently
 		// empty, which is the only condition under which it's
 		// safe to drop d from the chain.
-		d2 := loadPoolChainElt(&d.next)
+		d2 := loadPoolChainElt[T](&d.next)
 
 		if val, ok := d.popTail(); ok {
 			return val, ok
@@ -291,7 +292,7 @@ func (c *poolChain) popTail() (interface{}, bool) {
 		if d2 == nil {
 			// This is the only dequeue. It's empty right
 			// now, but could be pushed to in the future.
-			return nil, false
+			return zero[T](), false
 		}
 
 		// The tail of the chain has been drained, so move on
@@ -303,50 +304,50 @@ func (c *poolChain) popTail() (interface{}, bool) {
 			// the garbage collector can collect the empty
 			// dequeue and so popHead doesn't back up
 			// further than necessary.
-			storePoolChainElt(&d2.prev, nil)
+			storePoolChainElt[T](&d2.prev, nil)
 		}
 		d = d2
 	}
 }
 
-func NewPoolChain() PoolDequeue {
-	return new(poolChain)
+func NewPoolChain[T any]() PoolDequeue[T] {
+	return new(poolChain[T])
 }
 
-func (c *poolChain) PushHead(val interface{}) bool {
+func (c *poolChain[T]) PushHead(val T) bool {
 	c.pushHead(val)
 	return true
 }
 
-func (c *poolChain) PopHead() (interface{}, bool) {
+func (c *poolChain[T]) PopHead() (T, bool) {
 	return c.popHead()
 }
 
-func (c *poolChain) PopTail() (interface{}, bool) {
+func (c *poolChain[T]) PopTail() (T, bool) {
 	return c.popTail()
 }
 
 // poolDequeue testing.
-type PoolDequeue interface {
-	PushHead(val interface{}) bool
-	PopHead() (interface{}, bool)
-	PopTail() (interface{}, bool)
+type PoolDequeue[T any] interface {
+	PushHead(val T) bool
+	PopHead() (T, bool)
+	PopTail() (T, bool)
 }
 
-func NewPoolDequeue(n int) PoolDequeue {
-	return &poolDequeue{
-		vals: make([]eface, n),
+func NewPoolDequeue[T any](n int) PoolDequeue[T] {
+	return &poolDequeue[T]{
+		vals: make([]*T, n),
 	}
 }
 
-func (d *poolDequeue) PushHead(val interface{}) bool {
+func (d *poolDequeue[T]) PushHead(val T) bool {
 	return d.pushHead(val)
 }
 
-func (d *poolDequeue) PopHead() (interface{}, bool) {
+func (d *poolDequeue[T]) PopHead() (T, bool) {
 	return d.popHead()
 }
 
-func (d *poolDequeue) PopTail() (interface{}, bool) {
+func (d *poolDequeue[T]) PopTail() (T, bool) {
 	return d.popTail()
 }
