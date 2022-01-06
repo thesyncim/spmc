@@ -1,6 +1,6 @@
 SPMC
 
-Generic lock free single producer multiple consumer (adapted from implementation golang sync.Pool)
+Generic lock free single producer multiple consumer (adapted from sync.Pool)
 
 
 ``` 
